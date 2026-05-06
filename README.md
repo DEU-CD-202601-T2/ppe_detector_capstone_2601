@@ -16,14 +16,14 @@ YOLO-World와 YOLO Pose 모델을 활용하며, NVIDIA Jetson Orin Nano Super에
 | OS | Ubuntu 22.04 (JetPack R36.4.7) |
 | CUDA | 12.6 |
 | TensorRT | 10.3.0 |
-| 카메라 | ArduCAM IMX477 (CSI) |
+| 카메라 | ArduCAM IMX477 (CSI) + USB 웹캠 |
 
 ---
 
 ## 파일 구조
 
 ```
-capstone_2601/
+ppe_detector_capstone_2601/
 ├── models/                          # 모델 가중치 파일 (별도 준비 필요)
 │   ├── yolov8s-worldv2.pt           # YOLO-World pt 모델
 │   ├── yolov8s-worldv2.engine       # TensorRT 변환 모델
@@ -74,7 +74,7 @@ uv --version
 ### 5. 가상환경 생성
 
 ```bash
-cd ~/Documents/capstone_2601
+cd ~/Documents/ppe_detector_capstone_2601
 uv venv PPEDetector --python 3.10
 source PPEDetector/bin/activate
 ```
@@ -84,7 +84,29 @@ source PPEDetector/bin/activate
 ```bash
 wget https://developer.download.nvidia.com/compute/redist/jp/v61/pytorch/torch-2.5.0a0+872d972e41.nv24.08.17622132-cp310-cp310-linux_aarch64.whl
 mv torch-2.5.0a0+872d972e41.nv24.08.17622132-cp310-cp310-linux_aarch64.whl torch-2.5.0a0-cp310-cp310-linux_aarch64.whl
-UV_SKIP_WHEEL_FILENAME_CHECK=1 uv pip install torch-2.5.0a0-cp310-cp310-linux_aarch64.whl
+```
+
+> ⚠️ **주의:** `$(which python3)` 는 시스템 Python(`/usr/bin/python3`)을 가리켜 권한 오류가 발생합니다.  
+> 반드시 가상환경 Python 경로를 **직접** 지정해야 합니다.
+
+```bash
+UV_SKIP_WHEEL_FILENAME_CHECK=1 uv pip install \
+  --python ~/Documents/ppe_detector_capstone_2601/PPEDetector/bin/python3 \
+  torch-2.5.0a0-cp310-cp310-linux_aarch64.whl
+```
+
+#### python3 명령어 alias 등록
+
+설치 후에도 `python3` 명령이 시스템 Python을 가리켜 `import torch`가 실패합니다.  
+`which python3`는 alias를 무시하므로 `type python3`로 확인해야 합니다.
+
+```bash
+echo 'alias python3="~/Documents/ppe_detector_capstone_2601/PPEDetector/bin/python3"' >> ~/.bashrc
+source ~/.bashrc
+
+# alias 적용 확인 (which 가 아닌 type 으로 확인)
+type python3
+# 출력: python3은(는) '..../PPEDetector/bin/python3'의 별칭임
 ```
 
 CUDA 연동 확인:
@@ -141,7 +163,7 @@ uv pip install "numpy<2"
 
 ```bash
 ln -s /usr/lib/python3.10/dist-packages/tensorrt \
-  ~/Documents/capstone_2601/PPEDetector/lib/python3.10/site-packages/tensorrt
+  ~/Documents/ppe_detector_capstone_2601/PPEDetector/lib/python3.10/site-packages/tensorrt
 
 python3 -c "import tensorrt as trt; print(trt.__version__)"
 # 출력: 10.3.0
@@ -157,9 +179,9 @@ uv pip uninstall opencv-python opencv-contrib-python
 sudo apt install -y python3-opencv
 
 # 심볼릭 링크 연결
-rm ~/Documents/capstone_2601/PPEDetector/lib/python3.10/site-packages/cv2
+rm ~/Documents/ppe_detector_capstone_2601/PPEDetector/lib/python3.10/site-packages/cv2
 ln -s /usr/lib/python3.10/dist-packages/cv2 \
-  ~/Documents/capstone_2601/PPEDetector/lib/python3.10/site-packages/cv2
+  ~/Documents/ppe_detector_capstone_2601/PPEDetector/lib/python3.10/site-packages/cv2
 
 # GStreamer 지원 확인
 python3 -c "import cv2; print(cv2.getBuildInformation())" | grep GStreamer
@@ -213,10 +235,10 @@ python3 export_trt.py
 ## 실행
 
 ```bash
-cd ~/Documents/capstone_2601
+cd ~/Documents/ppe_detector_capstone_2601
 source PPEDetector/bin/activate
 
-# TensorRT 엔진 버전 (권장, 더 빠름)
+# TensorRT 엔진 버전 (권장)
 python3 ppe_detection_with_trt.py
 
 # PyTorch pt 버전
@@ -224,6 +246,32 @@ python3 ppe_detection.py
 ```
 
 종료: `q` 키
+
+### 카메라 자동 탐지
+
+`ppe_detection_with_trt.py`는 실행 시 연결된 카메라를 자동으로 탐지합니다.  
+CSI 카메라와 USB 웹캠을 별도로 설정할 필요 없이, 연결된 카메라 수에 따라 창이 자동으로 열립니다.
+
+```
+▶ CSI 카메라 탐지 중...
+  ✓ CSI 카메라 추가 (sensor-id=0)
+▶ USB 카메라 탐지 중...
+  → /dev/video2 시도 중... ✓ 추가됨
+  → /dev/video3 시도 중... ✗ (메타 노드이거나 프레임 없음)
+
+■ 활성 카메라 2개: ['CSI', 'USB2']
+```
+
+탐지 로직은 `v4l2-ctl --list-devices` 출력을 파싱해 USB 장치만 추려내며, tegra(CSI) 노드와 프레임이 없는 메타 노드는 자동으로 제외됩니다.
+
+파일 상단에서 조정 가능한 설정값:
+
+| 설정값 | 설명 |
+|--------|------|
+| `CSI_SENSOR_ID` | CSI 카메라 sensor-id (기본값: 0) |
+| `WB_MODE` | CSI 화이트밸런스 모드 (1=백열등, 4=형광등) |
+| `CSI_B/G/R_GAIN` | CSI 화이트밸런스 보정 게인 |
+| `USB_W`, `USB_H`, `USB_FPS` | USB 웹캠 해상도 및 프레임레이트 |
 
 ---
 
