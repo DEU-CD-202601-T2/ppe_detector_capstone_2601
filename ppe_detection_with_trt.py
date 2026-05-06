@@ -1,3 +1,4 @@
+import os
 import cv2
 import numpy as np
 import time
@@ -150,6 +151,40 @@ def parse_v4l2_devices() -> tuple[int, list[int]]:
                 usb_indices.append(int(m.group(1)))
 
     return csi_count, usb_indices
+
+
+def get_usb_camera_key(dev_idx: int) -> str:
+    """
+    /dev/videoN 에 대한 변하지 않는 식별자.
+    우선순위: vid:pid:serial > vid:pid:port_path > unknown fallback
+    """
+    sys_iface = f"/sys/class/video4linux/video{dev_idx}/device"
+    try:
+        # /sys/.../device 는 USB 인터페이스를 가리킴
+        # → 한 단계 위가 실제 USB device (idVendor/idProduct/serial 보유)
+        iface_real = os.path.realpath(sys_iface)
+        usb_dev    = os.path.dirname(iface_real)
+
+        def _read(name):
+            try:
+                with open(os.path.join(usb_dev, name)) as f:
+                    return f.read().strip()
+            except OSError:
+                return None
+
+        vid    = _read('idVendor')
+        pid    = _read('idProduct')
+        serial = _read('serial')
+
+        if vid and pid:
+            if serial:
+                return f"USB_{vid}_{pid}_{serial}"
+            port = os.path.basename(usb_dev)   # 예: '1-2.1'
+            return f"USB_{vid}_{pid}_PORT_{port}"
+    except Exception as e:
+        print(f"  ⚠ video{dev_idx} key 추출 실패: {e}")
+
+    return f"USB_UNKNOWN_video{dev_idx}"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -336,13 +371,14 @@ class CameraThread:
 
     FAIL_LIMIT = 30
 
-    def __init__(self, cap: cv2.VideoCapture, name: str,
+    def __init__(self, cap, name, key,
                  reopen_fn=None,
                  b_gain: float = 1.0,
                  g_gain: float = 1.0,
                  r_gain: float = 1.0):
         self.cap       = cap
         self.name      = name
+        self.key       = key
         self.reopen_fn = reopen_fn
         self.b_gain    = b_gain
         self.g_gain    = g_gain
@@ -784,7 +820,12 @@ def stream(cam_name):
 
 @app.route('/cameras')
 def cameras_list():
-    return {'cameras': [cam.name for cam in cameras]}
+    return {
+        'cameras': [
+            {'name': cam.name, 'key': cam.key}
+            for cam in cameras
+        ]
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -811,14 +852,15 @@ for sensor_id in range(csi_count):
     cap = open_csi_camera(sensor_id)
     if cap is not None:
         name = f"CAM{cam_id}(CSI{sensor_id})"
+        key  = f"CSI_{sensor_id}"
         cameras.append(CameraThread(
-            cap, name,
+            cap, name, key,
             reopen_fn=None,          # CSI는 재연결 미지원
             b_gain=CSI_B_GAIN,
             g_gain=CSI_G_GAIN,
             r_gain=CSI_R_GAIN,
         ))
-        print(f"✓ {name} 추가")
+        print(f"✓ {name} 추가  [key={key}]")
         cam_id += 1
     else:
         print("✗ 열기 실패")
@@ -829,14 +871,15 @@ for dev_idx in usb_candidates:
     cap = open_usb_camera(dev_idx)
     if cap is not None:
         name = f"CAM{cam_id}(USB{dev_idx})"
+        key  = get_usb_camera_key(dev_idx)
         cameras.append(CameraThread(
-            cap, name,
+            cap, name, key,
             reopen_fn=lambda i=dev_idx: open_usb_camera(i),  # 클로저로 idx 고정
             b_gain=USB_B_GAIN,
             g_gain=USB_G_GAIN,
             r_gain=USB_R_GAIN,
         ))
-        print(f"✓ {name} 추가")
+        print(f"✓ {name} 추가  [key={key}]")
         cam_id += 1
     else:
         print("✗ (메타 노드이거나 프레임 없음)")
@@ -850,14 +893,15 @@ if rs_serials:
         rs_source = open_realsense_camera(serial)
         if rs_source is not None:
             name = f"CAM{cam_id}(RS_{serial[-6:]})"
+            key  = f"RS_{serial}"
             cameras.append(CameraThread(
-                rs_source, name,
+                rs_source, name, key,
                 reopen_fn=lambda s=serial: open_realsense_camera(s),
                 b_gain=USB_B_GAIN,
                 g_gain=USB_G_GAIN,
                 r_gain=USB_R_GAIN,
             ))
-            print(f"✓ {name} 추가")
+            print(f"✓ {name} 추가  [key={key}]")
             cam_id += 1
         else:
             print("✗ 열기 실패")
