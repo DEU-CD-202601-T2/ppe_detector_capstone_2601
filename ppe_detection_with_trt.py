@@ -4,9 +4,20 @@ import time
 import re
 import subprocess
 import threading
+import atexit
+import signal
+import sys
 import torch
 from ultralytics import YOLO
 from flask import Flask, Response
+
+# RealSense 지원 (선택적 — 없으면 graceful degradation)
+try:
+    import pyrealsense2 as rs
+    REALSENSE_AVAILABLE = True
+except ImportError:
+    REALSENSE_AVAILABLE = False
+    print("⚠ pyrealsense2 import 실패 — RealSense 카메라 미지원 모드로 동작")
 
 print(f"CUDA 사용 가능: {torch.cuda.is_available()}")
 
@@ -93,8 +104,8 @@ def parse_v4l2_devices() -> tuple[int, list[int]]:
     (csi_count, usb_video_indices) 를 반환.
 
     csi_count  : 감지된 CSI(vi-output) 카메라 수
-                 → nvarguscamerasrc sensor-id 는 0 부터 순번 부여
     usb_video_indices : USB 그룹 아래의 /dev/videoN 번호 리스트
+                        (RealSense/Depth 카메라는 제외)
     """
     try:
         raw = subprocess.check_output(
@@ -106,7 +117,7 @@ def parse_v4l2_devices() -> tuple[int, list[int]]:
         print("  ⚠ v4l2-ctl 실행 실패")
         return 0, []
 
-    csi_count   = 0
+    csi_count = 0
     usb_indices: list[int] = []
     current_type = None   # "csi" | "usb" | None
 
@@ -118,10 +129,15 @@ def parse_v4l2_devices() -> tuple[int, list[int]]:
 
         # 장치 그룹 헤더 판별
         if stripped.endswith(":"):
-            if "vi-output" in stripped.lower():
+            low = stripped.lower()
+            # RealSense / Depth 카메라는 일반 V4L2로 못 다루므로 제외
+            if "realsense" in low or "depth" in low:
+                current_type = None
+                continue
+            if "vi-output" in low:
                 current_type = "csi"
-                csi_count += 1          # CSI 카메라 1개 카운트
-            elif "usb-" in stripped.lower():
+                csi_count += 1
+            elif "usb-" in low:
                 current_type = "usb"
             else:
                 current_type = None
@@ -159,31 +175,49 @@ def open_csi_camera(sensor_id: int) -> cv2.VideoCapture | None:
 
 def open_usb_camera(device_idx: int) -> cv2.VideoCapture | None:
     """
-    USB 웹캠 열기. GStreamer → V4L2 fallback 순으로 시도.
+    USB 웹캠 열기. MJPG 우선 → raw → V4L2 fallback 순으로 시도.
     실제 프레임이 나오는지까지 검증해 메타 노드를 걸러냄.
     """
-    # ① GStreamer v4l2src
-    pipeline = (
+    # ① GStreamer + MJPG (USB 캠 표준 경로)
+    pipeline_mjpg = (
         f"v4l2src device=/dev/video{device_idx} ! "
-        f"video/x-raw,width={USB_W},height={USB_H},framerate={USB_FPS}/1 ! "
-        f"videoconvert ! video/x-raw,format=BGR ! "
+        f"image/jpeg,width={USB_W},height={USB_H},framerate={USB_FPS}/1 ! "
+        f"jpegdec ! videoconvert ! video/x-raw,format=BGR ! "
         f"appsink max-buffers=1 drop=true"
     )
-    cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+    cap = cv2.VideoCapture(pipeline_mjpg, cv2.CAP_GSTREAMER)
+    if cap.isOpened():
+        print(f"  [video{device_idx}] GStreamer MJPG 경로 사용", flush=True)
 
-    # ② V4L2 직접 접근 fallback
+    # ② GStreamer + raw (MJPG 미지원 캠 fallback)
+    if not cap.isOpened():
+        cap.release()
+        pipeline_raw = (
+            f"v4l2src device=/dev/video{device_idx} ! "
+            f"video/x-raw,width={USB_W},height={USB_H},framerate={USB_FPS}/1 ! "
+            f"videoconvert ! video/x-raw,format=BGR ! "
+            f"appsink max-buffers=1 drop=true"
+        )
+        cap = cv2.VideoCapture(pipeline_raw, cv2.CAP_GSTREAMER)
+        if cap.isOpened():
+            print(f"  [video{device_idx}] GStreamer raw 경로 사용", flush=True)
+
+    # ③ V4L2 직접 접근 fallback (MJPG fourcc 명시)
     if not cap.isOpened():
         cap.release()
         cap = cv2.VideoCapture(device_idx, cv2.CAP_V4L2)
         if cap.isOpened():
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
             cap.set(cv2.CAP_PROP_FRAME_WIDTH,  USB_W)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, USB_H)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            cap.set(cv2.CAP_PROP_FPS,          USB_FPS)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+            print(f"  [video{device_idx}] V4L2 직접 접근 경로 사용", flush=True)
         else:
             cap.release()
             return None
 
-    # ③ 실제 프레임 수신 확인
+    # ④ 실제 프레임 수신 확인
     for _ in range(5):
         ret, frame = cap.read()
         if ret and frame is not None and frame.size > 0:
@@ -195,7 +229,100 @@ def open_usb_camera(device_idx: int) -> cv2.VideoCapture | None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 카메라 스레드 (Non-blocking 캡처 + USB 자동 재연결)
+# RealSense 카메라 (librealsense2 → cv2.VideoCapture 호환 어댑터)
+#
+# RealSense 는 컬러/깊이/IR/IMU 스트림이 /dev/video0~5 에 흩어져 있어
+# 일반 V4L2 로 다루기 어려움. librealsense2 의 pipeline API 를 사용해
+# 컬러 스트림만 BGR8 로 받아서 cv2.VideoCapture 인터페이스로 노출한다.
+# 이렇게 하면 기존 CameraThread 가 USB 캠과 동일하게 처리할 수 있다.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class RealSenseColorSource:
+    """librealsense2 컬러 스트림을 cv2.VideoCapture 호환 인터페이스로 감싸는 어댑터.
+
+    CameraThread 가 호출하는 메서드만 구현:
+      - grab()     : 다음 프레임을 내부 버퍼로 가져옴 (bool 반환)
+      - retrieve() : 가장 최근 프레임을 반환 ((ret, frame))
+      - isOpened() : 파이프라인 활성 여부
+      - release()  : 파이프라인 정지
+    """
+
+    def __init__(self, serial: str = "",
+                 width: int = 1280, height: int = 720, fps: int = 30):
+        self.serial = serial
+        self.pipe = rs.pipeline()
+        cfg = rs.config()
+        if serial:
+            cfg.enable_device(serial)
+        cfg.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
+        self.profile = self.pipe.start(cfg)
+        self._opened = True
+        self._latest_frame = None
+
+        # 자동 노출/화이트밸런스 안정화 워밍업
+        for _ in range(5):
+            try:
+                self.pipe.wait_for_frames(timeout_ms=2000)
+            except Exception:
+                break
+
+    def grab(self) -> bool:
+        try:
+            frames = self.pipe.wait_for_frames(timeout_ms=500)
+            color = frames.get_color_frame()
+            if color:
+                self._latest_frame = np.asanyarray(color.get_data())
+                return True
+        except Exception:
+            pass
+        return False
+
+    def retrieve(self):
+        if self._latest_frame is not None:
+            return True, self._latest_frame.copy()
+        return False, None
+
+    def isOpened(self) -> bool:
+        return self._opened
+
+    def release(self):
+        if self._opened:
+            try:
+                self.pipe.stop()
+            except Exception:
+                pass
+            self._opened = False
+
+
+def detect_realsense_devices() -> list[str]:
+    """연결된 RealSense 장치의 serial number 목록 반환."""
+    if not REALSENSE_AVAILABLE:
+        return []
+    try:
+        ctx = rs.context()
+        return [d.get_info(rs.camera_info.serial_number)
+                for d in ctx.query_devices()]
+    except Exception as e:
+        print(f"  ⚠ RealSense 탐지 실패: {e}")
+        return []
+
+
+def open_realsense_camera(serial: str):
+    """RealSense 컬러 스트림 열기. 실패 시 None 반환."""
+    if not REALSENSE_AVAILABLE:
+        return None
+    try:
+        return RealSenseColorSource(
+            serial=serial,
+            width=USB_W, height=USB_H, fps=USB_FPS,
+        )
+    except Exception as e:
+        print(f"  RealSense({serial[-6:]}) 열기 실패: {e}")
+        return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 카메라 스레드 (Non-blocking 캡처 + USB/RealSense 자동 재연결)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class CameraThread:
@@ -231,9 +358,12 @@ class CameraThread:
 
     def _run(self):
         while self._running:
-            # 카메라 내부 버퍼를 비워 최신 프레임만 가져옴
-            for _ in range(4):
-                self.cap.grab()
+            # _running 체크를 빠르게 하기 위해 grab을 한 번씩만
+            if not self._running:
+                break
+            self.cap.grab()
+            if not self._running:
+                break
             ret, frame = self.cap.retrieve()
 
             if not ret:
@@ -272,8 +402,18 @@ class CameraThread:
             return self._frame.copy() if self._frame is not None else None
 
     def stop(self):
+        """
+        스레드의 자연 종료를 기다린 후 release.
+        daemon 스레드가 cap.grab() 안에 블로킹된 상태로 release 되면
+        OS 레벨에서 V4L2 핸들이 깔끔히 닫히지 않는 race condition 방지.
+        """
         self._running = False
-        self.cap.release()
+        if self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+        try:
+            self.cap.release()
+        except Exception:
+            pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -650,10 +790,11 @@ def cameras_list():
 # ══════════════════════════════════════════════════════════════════════════════
 # ★ 카메라 자동 탐지 및 초기화
 #
-# 1. v4l2-ctl 파싱 → CSI 개수 / USB 장치 번호 추출
+# 1. v4l2-ctl 파싱 → CSI 개수 / USB 장치 번호 추출 (RealSense 노드는 제외)
 # 2. CSI: sensor-id 0 부터 순서대로 시도 → CAM0, CAM1, ...
 # 3. USB: /dev/videoN 순서대로 시도 → 프레임 확인 후 추가
-# 4. 발견 순서대로 전역 카메라 ID(cam_id) 부여
+# 4. RealSense: pyrealsense2 로 컬러 스트림 열기 (가능한 경우)
+# 5. 발견 순서대로 전역 카메라 ID(cam_id) 부여
 # ══════════════════════════════════════════════════════════════════════════════
 
 cameras: list[CameraThread] = []
@@ -700,6 +841,29 @@ for dev_idx in usb_candidates:
     else:
         print("✗ (메타 노드이거나 프레임 없음)")
 
+# ── RealSense 카메라 ─────────────────────────────────────────
+rs_serials = detect_realsense_devices()
+if rs_serials:
+    print(f"  감지된 RealSense: {len(rs_serials)}대 (S/N: {[s[-6:] for s in rs_serials]})")
+    for serial in rs_serials:
+        print(f"  → RealSense {serial[-6:]} 시도 중...", end=" ", flush=True)
+        rs_source = open_realsense_camera(serial)
+        if rs_source is not None:
+            name = f"CAM{cam_id}(RS_{serial[-6:]})"
+            cameras.append(CameraThread(
+                rs_source, name,
+                reopen_fn=lambda s=serial: open_realsense_camera(s),
+                b_gain=USB_B_GAIN,
+                g_gain=USB_G_GAIN,
+                r_gain=USB_R_GAIN,
+            ))
+            print(f"✓ {name} 추가")
+            cam_id += 1
+        else:
+            print("✗ 열기 실패")
+elif REALSENSE_AVAILABLE:
+    print("  감지된 RealSense: 0대")
+
 # ── 결과 요약 ─────────────────────────────────────────────────
 if not cameras:
     print("\n❌ 사용 가능한 카메라가 없습니다. 연결 상태를 확인하세요.")
@@ -729,13 +893,32 @@ print("✓ 추론 스레드 시작 (카메라 순차 처리)\n")
 
 print("\n종료하려면 Ctrl+C\n")
 
+# ── 모든 종료 경로에서 카메라 해제 보장 ──────────────────
+_cleanup_done = False
+
+def _cleanup_cameras():
+    global _cleanup_done
+    if _cleanup_done:
+        return
+    _cleanup_done = True
+    print("\n[cleanup] 카메라 해제 중...")
+    for cam in cameras:
+        try:
+            cam.stop()
+        except Exception as e:
+            print(f"  [{cam.name}] stop 실패: {e}")
+    print("[cleanup] 완료")
+
+atexit.register(_cleanup_cameras)
+signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
+signal.signal(signal.SIGHUP,  lambda s, f: sys.exit(0))
+
 try:
     while True:
         time.sleep(1)
 except KeyboardInterrupt:
     pass
+finally:
+    _cleanup_cameras()
 
-# ── 정리 ──────────────────────────────────────────────────────
-for cam in cameras:
-    cam.stop()
 print("종료")
