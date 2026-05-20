@@ -1,1 +1,35 @@
+# === 시크릿 (절대 커밋 금지) ===
+.env
+*.pem
+*.ppk
+.ssh/
+
+# === 가상환경 (수백 MB, 재현 가능) ===
 PPEDetector/
+venv/
+.venv/
+
+# === 파이썬 캐시 ===
+__pycache__/
+*.py[cod]
+*.so
+
+# === 백업/임시 ===
+*.bak
+*.swp
+*.tmp
+get-pip.py
+
+# === 생성된 산출물 ===
+# 테스트 시 추출한 위반 이미지
+violation_*.jpg
+violation_*.png
+
+# TensorRT 엔진 (아키텍처/버전 종속, .pt에서 재생성 가능)
+models/*.engine
+
+# === OS/IDE ===
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

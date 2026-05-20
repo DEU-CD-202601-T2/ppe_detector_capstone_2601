@@ -1,3 +1,4 @@
+import supervision as sv
 import os
 import cv2
 import numpy as np
@@ -11,6 +12,10 @@ import sys
 import torch
 from ultralytics import YOLO
 from flask import Flask, Response
+from area_loader        import load_camera_area_map
+from violation_tracker  import ViolationStateTracker
+from violation_logger   import ViolationLogger
+from image_utils        import crop_and_encode
 
 # RealSense 지원 (선택적 — 없으면 graceful degradation)
 try:
@@ -43,8 +48,8 @@ MASK_ROI_HEIGHT   = 80
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-WORLD_CLASSES = ["person", "glove", "helmet", "mask"]
-CLASS_CONF    = {"person": 0.50, "helmet": 0.10, "mask": 0.10, "glove": 0.10}
+WORLD_CLASSES = ["person", "glove", "helmet", "mask", "vest"]
+CLASS_CONF    = {"person": 0.50, "helmet": 0.10, "mask": 0.10, "glove": 0.10, "vest": 0.10}
 
 COLOR_PERSON     = (255,   0,   0)
 COLOR_POSE_LINE  = (  0, 255, 255)
@@ -471,6 +476,30 @@ def filter_boxes_in_region(results, class_name,
     return boxes
 
 
+def filter_person_boxes_with_id(results, rx1=0, ry1=0, rx2=99999, ry2=99999):
+    """person 박스 + 트래커 ID 함께 추출.
+
+    반환: [(x1, y1, x2, y2, conf, person_id), ...]
+    ID가 없는 경우(트래커가 아직 부여 안 함) person_id = -1
+    """
+    boxes = []
+    r     = results[0]
+    names = r.names if r.names else {i: c for i, c in enumerate(WORLD_CLASSES)}
+    thr   = CLASS_CONF.get("person", 0.1)
+    ids   = r.boxes.id  # tensor or None
+
+    for i, b in enumerate(r.boxes):
+        if names[int(b.cls)] != "person" or float(b.conf) < thr:
+            continue
+        x1, y1, x2, y2 = [round(v) for v in b.xyxy[0].tolist()]
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        if not (rx1 <= cx <= rx2 and ry1 <= cy <= ry2):
+            continue
+        pid = int(ids[i].item()) if ids is not None else -1
+        boxes.append((x1, y1, x2, y2, float(b.conf), pid))
+    return boxes
+
+
 def get_keypoints_for_person(pose_results, px1, py1, px2, py2):
     if not pose_results or pose_results[0].keypoints is None:
         return None
@@ -629,13 +658,13 @@ def draw_pose(frame, keypoints, img_w, img_h):
         cv2.circle(frame, p, lm_r, (255, 255, 255), max(1, lm_r//3))
 
 
-def draw_ppe_status(frame, bx1, by1, person_idx, person_conf, status):
+def draw_ppe_status(frame, bx1, by1, person_id, person_conf, status):
     font            = cv2.FONT_HERSHEY_SIMPLEX
     font_scale_base = 0.6
     font_scale_ox   = 0.65
     thickness_base  = 2
     thickness_ox    = 2
-    base_text = f"P{person_idx} {person_conf:.2f} "
+    base_text = f"ID{person_id} {person_conf:.2f} " if person_id >= 0 else f"ID? {person_conf:.2f} "
     (bw, bh), _ = cv2.getTextSize(base_text, font, font_scale_base, thickness_base)
     sep_text = "| "
     (sw, _), _ = cv2.getTextSize(sep_text, font, font_scale_ox, thickness_ox)
@@ -706,18 +735,51 @@ def process_person(frame, px1, py1, px2, py2, img_w, img_h,
     }
 
 
-def run_inference_on_frame(frame):
+def run_inference_on_frame(frame, cam_key: str):
     img_h, img_w = frame.shape[:2]
-    all_results  = yolo_model(frame, imgsz=640,
-                              conf=min(CLASS_CONF.values()),
-                              iou=0.45, verbose=False, device=0)
+    original_frame = frame.copy()
+
+    # 일반 detect() — PPE 인식 정확도 유지
+    all_results = yolo_model(frame, imgsz=640,
+                             conf=min(CLASS_CONF.values()),
+                             iou=0.45, verbose=False, device=0)
     pose_results = pose_model(frame, imgsz=640, verbose=False, device=0)
-    person_boxes = filter_boxes_in_region(all_results, "person")
-    for i, (bx1, by1, bx2, by2, conf) in enumerate(person_boxes):
+
+    # person 박스만 추출해서 별도 트래커에 적용
+    dets = sv.Detections.from_ultralytics(all_results[0])
+    person_idx = WORLD_CLASSES.index("person")
+    person_dets = dets[(dets.class_id == person_idx) &
+                       (dets.confidence >= CLASS_CONF["person"])]
+    person_dets = person_tracker.update_with_detections(person_dets)
+
+    area_id = CAMERA_AREA_MAP.get(cam_key)
+
+    for i in range(len(person_dets)):
+        bx1, by1, bx2, by2 = person_dets.xyxy[i].astype(int).tolist()
+        conf = float(person_dets.confidence[i])
+        tid = person_dets.tracker_id
+        person_id = int(tid[i]) if tid is not None and tid[i] is not None else -1
+
         cv2.rectangle(frame, (bx1, by1), (bx2, by2), COLOR_PERSON, 2)
         status = process_person(frame, bx1, by1, bx2, by2, img_w, img_h,
                                 all_results, pose_results)
-        draw_ppe_status(frame, bx1, by1, i+1, conf, status)
+        draw_ppe_status(frame, bx1, by1, person_id, conf, status)
+
+        if area_id is None or person_id < 0:
+            continue
+        events = violation_tracker.update(cam_key, person_id, status)
+        for ev in events:
+            try:
+                jpeg = crop_and_encode(original_frame, bx1, by1, bx2, by2)
+                violation_logger.log(
+                    violation_type=ev.violation_type,
+                    area_id=area_id,
+                    person_id=ev.person_id,
+                    image_jpeg=jpeg,
+                )
+            except Exception as e:
+                print(f"  ⚠ 위반 처리 실패: {type(e).__name__}: {e}")
+
     return frame
 
 
@@ -728,7 +790,23 @@ def run_inference_on_frame(frame):
 print("▶ 모델 로드 중...")
 yolo_model = YOLO("models/yolov8s-worldv2.engine", task="detect")
 pose_model = YOLO("models/yolo11n-pose.engine",    task="pose")
+person_tracker = sv.ByteTrack()
 print("✓ 모델 로드 완료")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 위반 추적/저장 초기화
+# ══════════════════════════════════════════════════════════════════════════════
+
+print("▶ areas 매핑 로드 중...")
+CAMERA_AREA_MAP = load_camera_area_map()
+print(f"✓ {len(CAMERA_AREA_MAP)}개 카메라 매핑 로드:")
+for ck, aid in CAMERA_AREA_MAP.items():
+    print(f"  {ck} → area_id={aid}")
+
+violation_tracker = ViolationStateTracker()  # 기본값: 3초/30초
+violation_logger  = ViolationLogger()
+print("✓ 위반 추적기/로거 준비 완료")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -774,7 +852,7 @@ def inference_loop(cam_list):
 
             # ── 추론 (항상 실행, 모델 공유) ──────────────────
             t0  = time.time()
-            out = run_inference_on_frame(frame)
+            out = run_inference_on_frame(frame, cam.key)
             fps_map[cam.name] = 1.0 / max(time.time() - t0, 1e-6)
 
             cv2.putText(out, f"[{cam.name}] FPS: {fps_map[cam.name]:.1f}",
