@@ -10,6 +10,7 @@ import atexit
 import signal
 import sys
 import torch
+import fcntl
 from ultralytics import YOLO
 from flask import Flask, Response
 from area_loader        import load_camera_area_map
@@ -17,15 +18,15 @@ from violation_tracker  import ViolationStateTracker
 from violation_logger   import ViolationLogger
 from image_utils        import crop_and_encode
 
-# RealSense 지원 (선택적 — 없으면 graceful degradation)
-try:
-    import pyrealsense2 as rs
-    REALSENSE_AVAILABLE = True
-except ImportError:
-    REALSENSE_AVAILABLE = False
-    print("⚠ pyrealsense2 import 실패 — RealSense 카메라 미지원 모드로 동작")
-
 print(f"CUDA 사용 가능: {torch.cuda.is_available()}")
+
+_lockfile = open('/tmp/ppe_detection.lock', 'w')
+try:
+    fcntl.flock(_lockfile, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    print("✗ 이미 다른 인스턴스가 실행 중입니다. (lockfile: /tmp/ppe_detection.lock)")
+    print("  종료: sudo fuser -k 5001/tcp")
+    sys.exit(1)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 설정
@@ -104,14 +105,41 @@ COCO_SKELETON = [
 #   usb_devices = [2, 3] → /dev/video2, /dev/video3 순서로 시도
 # ══════════════════════════════════════════════════════════════════════════════
 
+
+# ── 컬러 캡처 노드로 인정할 픽셀 포맷 (fourcc 4자) ─────────
+COLOR_FOURCCS = {"YUYV", "MJPG", "BGR3", "RGB3", "NV12", "UYVY", "YV12"}
+# 참고: Z16=depth, GREY/Y8/Y8I/Y10/Y12/Y16=IR, metadata 노드는 list-formats가 비어있음.
+
+
+def get_video_node_formats(dev_idx: int) -> list[str]:
+    """
+    /dev/videoN 이 노출하는 픽셀 포맷 fourcc 리스트 (4자 문자열).
+    실패/메타 노드는 빈 리스트.
+    """
+    try:
+        out = subprocess.check_output(
+            ["v4l2-ctl", "-d", f"/dev/video{dev_idx}", "--list-formats"],
+            stderr=subprocess.DEVNULL,
+            timeout=2
+        ).decode(errors="replace")
+    except Exception:
+        return []
+    # 라인 예: "[0]: 'YUYV' (YUYV 4:2:2)"
+    return re.findall(r"'([A-Z0-9 ]{4})'", out)
+
+
+def is_color_capture_node(dev_idx: int) -> bool:
+    """컬러 포맷 하나라도 노출하면 True. depth/IR/metadata 자동 제외."""
+    fmts = {f.strip() for f in get_video_node_formats(dev_idx)}
+    return bool(fmts & COLOR_FOURCCS)
+
+
 def parse_v4l2_devices() -> tuple[int, list[int]]:
     """
-    v4l2-ctl --list-devices 를 파싱해
-    (csi_count, usb_video_indices) 를 반환.
+    v4l2-ctl --list-devices 를 파싱해 (csi_count, usb_video_indices) 반환.
 
-    csi_count  : 감지된 CSI(vi-output) 카메라 수
-    usb_video_indices : USB 그룹 아래의 /dev/videoN 번호 리스트
-                        (RealSense/Depth 카메라는 제외)
+    RealSense도 USB 디바이스이므로 USB 그룹으로 함께 분류한 뒤,
+    is_color_capture_node 필터로 depth/IR/metadata 노드를 자동 제외한다.
     """
     try:
         raw = subprocess.check_output(
@@ -125,7 +153,7 @@ def parse_v4l2_devices() -> tuple[int, list[int]]:
 
     csi_count = 0
     usb_indices: list[int] = []
-    current_type = None   # "csi" | "usb" | None
+    current_type = None
 
     for line in raw.splitlines():
         stripped = line.strip()
@@ -133,29 +161,31 @@ def parse_v4l2_devices() -> tuple[int, list[int]]:
             current_type = None
             continue
 
-        # 장치 그룹 헤더 판별
         if stripped.endswith(":"):
             low = stripped.lower()
-            # RealSense / Depth 카메라는 일반 V4L2로 못 다루므로 제외
-            if "realsense" in low or "depth" in low:
-                current_type = None
-                continue
             if "vi-output" in low:
                 current_type = "csi"
                 csi_count += 1
             elif "usb-" in low:
+                # RealSense도 USB. 컬러/depth/IR 구분은 아래 포맷 필터에서.
                 current_type = "usb"
             else:
                 current_type = None
             continue
 
-        # /dev/videoN 수집 (USB 그룹만)
         if current_type == "usb":
             m = re.search(r"/dev/video(\d+)", stripped)
             if m:
                 usb_indices.append(int(m.group(1)))
 
-    return csi_count, usb_indices
+    # 컬러 노드만 통과 (depth/IR/metadata 자동 필터링)
+    color_nodes = [i for i in usb_indices if is_color_capture_node(i)]
+
+    rejected = sorted(set(usb_indices) - set(color_nodes))
+    if rejected:
+        print(f"  ℹ 컬러 미노출 노드 제외: {['/dev/video'+str(i) for i in rejected]}")
+
+    return csi_count, color_nodes
 
 
 def get_usb_camera_key(dev_idx: int) -> str:
@@ -266,99 +296,6 @@ def open_usb_camera(device_idx: int) -> cv2.VideoCapture | None:
 
     cap.release()
     return None
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# RealSense 카메라 (librealsense2 → cv2.VideoCapture 호환 어댑터)
-#
-# RealSense 는 컬러/깊이/IR/IMU 스트림이 /dev/video0~5 에 흩어져 있어
-# 일반 V4L2 로 다루기 어려움. librealsense2 의 pipeline API 를 사용해
-# 컬러 스트림만 BGR8 로 받아서 cv2.VideoCapture 인터페이스로 노출한다.
-# 이렇게 하면 기존 CameraThread 가 USB 캠과 동일하게 처리할 수 있다.
-# ══════════════════════════════════════════════════════════════════════════════
-
-class RealSenseColorSource:
-    """librealsense2 컬러 스트림을 cv2.VideoCapture 호환 인터페이스로 감싸는 어댑터.
-
-    CameraThread 가 호출하는 메서드만 구현:
-      - grab()     : 다음 프레임을 내부 버퍼로 가져옴 (bool 반환)
-      - retrieve() : 가장 최근 프레임을 반환 ((ret, frame))
-      - isOpened() : 파이프라인 활성 여부
-      - release()  : 파이프라인 정지
-    """
-
-    def __init__(self, serial: str = "",
-                 width: int = 1280, height: int = 720, fps: int = 30):
-        self.serial = serial
-        self.pipe = rs.pipeline()
-        cfg = rs.config()
-        if serial:
-            cfg.enable_device(serial)
-        cfg.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
-        self.profile = self.pipe.start(cfg)
-        self._opened = True
-        self._latest_frame = None
-
-        # 자동 노출/화이트밸런스 안정화 워밍업
-        for _ in range(5):
-            try:
-                self.pipe.wait_for_frames(timeout_ms=2000)
-            except Exception:
-                break
-
-    def grab(self) -> bool:
-        try:
-            frames = self.pipe.wait_for_frames(timeout_ms=500)
-            color = frames.get_color_frame()
-            if color:
-                self._latest_frame = np.asanyarray(color.get_data())
-                return True
-        except Exception:
-            pass
-        return False
-
-    def retrieve(self):
-        if self._latest_frame is not None:
-            return True, self._latest_frame.copy()
-        return False, None
-
-    def isOpened(self) -> bool:
-        return self._opened
-
-    def release(self):
-        if self._opened:
-            try:
-                self.pipe.stop()
-            except Exception:
-                pass
-            self._opened = False
-
-
-def detect_realsense_devices() -> list[str]:
-    """연결된 RealSense 장치의 serial number 목록 반환."""
-    if not REALSENSE_AVAILABLE:
-        return []
-    try:
-        ctx = rs.context()
-        return [d.get_info(rs.camera_info.serial_number)
-                for d in ctx.query_devices()]
-    except Exception as e:
-        print(f"  ⚠ RealSense 탐지 실패: {e}")
-        return []
-
-
-def open_realsense_camera(serial: str):
-    """RealSense 컬러 스트림 열기. 실패 시 None 반환."""
-    if not REALSENSE_AVAILABLE:
-        return None
-    try:
-        return RealSenseColorSource(
-            serial=serial,
-            width=USB_W, height=USB_H, fps=USB_FPS,
-        )
-    except Exception as e:
-        print(f"  RealSense({serial[-6:]}) 열기 실패: {e}")
-        return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -947,44 +884,19 @@ for sensor_id in range(csi_count):
 for dev_idx in usb_candidates:
     print(f"  → USB /dev/video{dev_idx} 시도 중...", end=" ", flush=True)
     cap = open_usb_camera(dev_idx)
-    if cap is not None:
-        name = f"CAM{cam_id}(USB{dev_idx})"
-        key  = get_usb_camera_key(dev_idx)
-        cameras.append(CameraThread(
-            cap, name, key,
-            reopen_fn=lambda i=dev_idx: open_usb_camera(i),  # 클로저로 idx 고정
-            b_gain=USB_B_GAIN,
-            g_gain=USB_G_GAIN,
-            r_gain=USB_R_GAIN,
-        ))
-        print(f"✓ {name} 추가  [key={key}]")
-        cam_id += 1
-    else:
+    if cap is None:
         print("✗ (메타 노드이거나 프레임 없음)")
+        continue
 
-# ── RealSense 카메라 ─────────────────────────────────────────
-rs_serials = detect_realsense_devices()
-if rs_serials:
-    print(f"  감지된 RealSense: {len(rs_serials)}대 (S/N: {[s[-6:] for s in rs_serials]})")
-    for serial in rs_serials:
-        print(f"  → RealSense {serial[-6:]} 시도 중...", end=" ", flush=True)
-        rs_source = open_realsense_camera(serial)
-        if rs_source is not None:
-            name = f"CAM{cam_id}(RS_{serial[-6:]})"
-            key  = f"RS_{serial}"
-            cameras.append(CameraThread(
-                rs_source, name, key,
-                reopen_fn=lambda s=serial: open_realsense_camera(s),
-                b_gain=USB_B_GAIN,
-                g_gain=USB_G_GAIN,
-                r_gain=USB_R_GAIN,
-            ))
-            print(f"✓ {name} 추가  [key={key}]")
-            cam_id += 1
-        else:
-            print("✗ 열기 실패")
-elif REALSENSE_AVAILABLE:
-    print("  감지된 RealSense: 0대")
+    key = get_usb_camera_key(dev_idx)
+    name = f"CAM{cam_id}(USB{dev_idx})"
+    cameras.append(CameraThread(
+        cap, name, key,
+        reopen_fn=lambda i=dev_idx: open_usb_camera(i),
+        b_gain=USB_B_GAIN, g_gain=USB_G_GAIN, r_gain=USB_R_GAIN,
+    ))
+    print(f"✓ {name} 추가  [key={key}]")
+    cam_id += 1
 
 # ── 결과 요약 ─────────────────────────────────────────────────
 if not cameras:
