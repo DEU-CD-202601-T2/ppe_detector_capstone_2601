@@ -687,7 +687,8 @@ def run_inference_on_frame(frame, cam_key: str):
     person_idx = WORLD_CLASSES.index("person")
     person_dets = dets[(dets.class_id == person_idx) &
                        (dets.confidence >= CLASS_CONF["person"])]
-    person_dets = person_tracker.update_with_detections(person_dets)
+    tracker = get_person_tracker(cam_key)
+    person_dets = tracker.update_with_detections(person_dets)
 
     area_id = CAMERA_AREA_MAP.get(cam_key)
 
@@ -702,20 +703,44 @@ def run_inference_on_frame(frame, cam_key: str):
                                 all_results, pose_results)
         draw_ppe_status(frame, bx1, by1, person_id, conf, status)
 
-        if area_id is None or person_id < 0:
+        if area_id is None:
+            debug_throttle(
+                f"area:{cam_key}",
+                f"[DB-SKIP] area_id 없음 | cam_key={cam_key} | map_keys={list(CAMERA_AREA_MAP.keys())}"
+            )
             continue
+
+        if person_id < 0:
+            debug_throttle(
+                f"pid:{cam_key}",
+                f"[DB-SKIP] person_id 없음 | cam_key={cam_key}"
+            )
+            continue
+
         events = violation_tracker.update(cam_key, person_id, status)
+
+        if not events:
+            debug_throttle(
+                f"event:{cam_key}:{person_id}",
+                f"[DB-WAIT] 이벤트 없음 | cam_key={cam_key} | area_id={area_id} | person_id={person_id} | status={status}"
+            )
+
         for ev in events:
             try:
                 jpeg = crop_and_encode(original_frame, bx1, by1, bx2, by2)
+                print(
+                    f"[DB-TRY] violation_type={ev.violation_type}, area_id={area_id}, person_id={ev.person_id}",
+                    flush=True
+                )
                 violation_logger.log(
                     violation_type=ev.violation_type,
                     area_id=area_id,
                     person_id=ev.person_id,
                     image_jpeg=jpeg,
                 )
+                print("[DB-OK] 위반 데이터 저장 완료", flush=True)
             except Exception as e:
-                print(f"  ⚠ 위반 처리 실패: {type(e).__name__}: {e}")
+                print(f"[DB-FAIL] 위반 처리 실패: {type(e).__name__}: {e}", flush=True)
 
     return frame
 
@@ -727,7 +752,14 @@ def run_inference_on_frame(frame, cam_key: str):
 print("▶ 모델 로드 중...")
 yolo_model = YOLO("models/yolov8s-worldv2.engine", task="detect")
 pose_model = YOLO("models/yolo11n-pose.engine",    task="pose")
-person_tracker = sv.ByteTrack()
+person_trackers = {}
+person_tracker_lock = threading.Lock()
+
+def get_person_tracker(cam_key: str):
+    with person_tracker_lock:
+        if cam_key not in person_trackers:
+            person_trackers[cam_key] = sv.ByteTrack()
+        return person_trackers[cam_key]
 print("✓ 모델 로드 완료")
 
 
@@ -741,7 +773,7 @@ print(f"✓ {len(CAMERA_AREA_MAP)}개 카메라 매핑 로드:")
 for ck, aid in CAMERA_AREA_MAP.items():
     print(f"  {ck} → area_id={aid}")
 
-violation_tracker = ViolationStateTracker()  # 기본값: 3초/30초
+violation_tracker = ViolationStateTracker()  # 기본값: 10초/300초
 violation_logger  = ViolationLogger()
 print("✓ 위반 추적기/로거 준비 완료")
 
@@ -756,6 +788,18 @@ frame_counters:  dict[str, int]   = {}
 active_streams:  dict[str, int]   = {}   # 카메라별 현재 접속자 수
 stream_lock      = threading.Lock()
 frame_lock       = threading.Lock()
+
+DEBUG_DB = True
+_last_debug_print = {}
+
+def debug_throttle(key: str, msg: str, interval: float = 2.0):
+    if not DEBUG_DB:
+        return
+    now = time.time()
+    last = _last_debug_print.get(key, 0)
+    if now - last >= interval:
+        print(msg, flush=True)
+        _last_debug_print[key] = now
 
 
 def update_annotated_frame(cam_name: str, frame):
