@@ -13,7 +13,13 @@ import torch
 import fcntl
 from ultralytics import YOLO
 from flask import Flask, Response
-from area_loader        import load_camera_area_map
+try:
+    from area_loader        import load_camera_area_map, load_area_ppe_rules
+except ImportError:
+    from area_loader        import load_camera_area_map
+    def load_area_ppe_rules():
+        print("⚠ area_loader.load_area_ppe_rules() 없음 → PPE 단속 기준 전체 ON으로 동작합니다.", flush=True)
+        return {}
 from violation_tracker  import ViolationStateTracker
 from violation_logger   import ViolationLogger
 from image_utils        import crop_and_encode
@@ -595,7 +601,14 @@ def draw_pose(frame, keypoints, img_w, img_h):
         cv2.circle(frame, p, lm_r, (255, 255, 255), max(1, lm_r//3))
 
 
-def draw_ppe_status(frame, bx1, by1, person_id, person_conf, status):
+def draw_ppe_status(frame, bx1, by1, person_id, person_conf, status, ppe_rule=None):
+    """
+    사람 박스 상단의 PPE 상태 표시.
+
+    표시 순서는 항상 안전모 → 마스크 → 왼손 장갑 → 오른손 장갑 순서를 유지한다.
+    다만 해당 구역에서 단속하지 않는 장비는 O/X 표시 개수에서 제외한다.
+    예: 마스크 단속 제외 → helmet | left_glove | right_glove 3개만 표시.
+    """
     font            = cv2.FONT_HERSHEY_SIMPLEX
     font_scale_base = 0.6
     font_scale_ox   = 0.65
@@ -603,16 +616,37 @@ def draw_ppe_status(frame, bx1, by1, person_id, person_conf, status):
     thickness_ox    = 2
     base_text = f"ID{person_id} {person_conf:.2f} " if person_id >= 0 else f"ID? {person_conf:.2f} "
     (bw, bh), _ = cv2.getTextSize(base_text, font, font_scale_base, thickness_base)
+
+    ppe_rule = ppe_rule or {
+        "helmet": True,
+        "mask": True,
+        "left_glove": True,
+        "right_glove": True,
+    }
+
+    display_items = []
+    display_order = [
+        ("helmet", "enforce_helmet"),
+        ("mask", "enforce_mask"),
+        ("left_glove", "enforce_glove_left"),
+        ("right_glove", "enforce_glove_right"),
+    ]
+
+    for status_key, enforce_key in display_order:
+        if rule_enabled(ppe_rule, status_key, enforce_key, True):
+            display_items.append(bool(status.get(status_key, True)))
+
     sep_text = "| "
     (sw, _), _ = cv2.getTextSize(sep_text, font, font_scale_ox, thickness_ox)
-    (ow, oh), _ = cv2.getTextSize("O", font, font_scale_ox, thickness_ox)
-    total_w = bw + (sw + ow + 4) * 4 + 8
+    (ow, _), _ = cv2.getTextSize("O", font, font_scale_ox, thickness_ox)
+
+    total_w = bw + (sw + ow + 4) * len(display_items) + 8
     tx, ty  = bx1, by1 - 8
     cv2.rectangle(frame, (tx-2, ty-bh-4), (tx+total_w+2, ty+4), (0, 0, 0), -1)
     cv2.putText(frame, base_text, (tx, ty), font, font_scale_base, COLOR_PERSON, thickness_base)
-    items = [status["helmet"], status["mask"], status["left_glove"], status["right_glove"]]
+
     cx = tx + bw
-    for ok in items:
+    for ok in display_items:
         sym   = "O" if ok else "X"
         color = COLOR_OK if ok else COLOR_NG
         cv2.putText(frame, "| ", (cx, ty), font, font_scale_ox, (180, 180, 180), 1)
@@ -622,43 +656,73 @@ def draw_ppe_status(frame, bx1, by1, person_id, person_conf, status):
 
 
 def process_person(frame, px1, py1, px2, py2, img_w, img_h,
-                   all_results, pose_results):
+                   all_results, pose_results, ppe_rule=None):
+    """
+    사람 1명에 대한 PPE 판정 및 화면 표시.
+
+    단속 제외 항목은 탐지/ROI 표시를 하지 않고 착용(True)으로 처리한다.
+    예: mask 단속 제외 → mask ROI/box 미표시 + no_mask 저장 방지.
+    """
+    rule = ppe_rule or {}
+
+    enforce_helmet = rule_enabled(rule, "helmet", "enforce_helmet", True)
+    enforce_mask = rule_enabled(rule, "mask", "enforce_mask", True)
+    enforce_left_glove = rule_enabled(rule, "left_glove", "enforce_glove_left", True)
+    enforce_right_glove = rule_enabled(rule, "right_glove", "enforce_glove_right", True)
+
     keypoints = get_keypoints_for_person(pose_results, px1, py1, px2, py2)
-    helmet_ok = draw_helmet(frame, all_results, px1, py1, px2, py2, keypoints)
-    mask_ok   = draw_mask(frame, all_results, px1, py1, px2, py2, keypoints)
 
-    glove_boxes = [(x1, y1, x2, y2)
-                   for x1, y1, x2, y2, _ in filter_boxes_in_region(
-                       all_results, "glove", rx1=px1, ry1=py1, rx2=px2, ry2=py2)]
-    for gx1, gy1, gx2, gy2 in glove_boxes:
-        cv2.rectangle(frame, (gx1, gy1), (gx2, gy2), COLOR_GLOVE, 2)
+    helmet_ok = draw_helmet(frame, all_results, px1, py1, px2, py2, keypoints) if enforce_helmet else True
+    mask_ok   = draw_mask(frame, all_results, px1, py1, px2, py2, keypoints) if enforce_mask else True
 
-    glove_status = {"left": False, "right": False}
+    enforce_any_glove = enforce_left_glove or enforce_right_glove
+    glove_boxes = []
+
+    if enforce_any_glove:
+        glove_boxes = [(x1, y1, x2, y2)
+                       for x1, y1, x2, y2, _ in filter_boxes_in_region(
+                           all_results, "glove", rx1=px1, ry1=py1, rx2=px2, ry2=py2)]
+        for gx1, gy1, gx2, gy2 in glove_boxes:
+            cv2.rectangle(frame, (gx1, gy1), (gx2, gy2), COLOR_GLOVE, 2)
+
+    glove_status = {
+        "left": True if not enforce_left_glove else False,
+        "right": True if not enforce_right_glove else False,
+    }
+
     wrist_cfg = [
-        (KP_LEFT_WRIST,  KP_LEFT_ELBOW,  "left",  "L", COLOR_LEFT_ROI),
-        (KP_RIGHT_WRIST, KP_RIGHT_ELBOW, "right", "R", COLOR_RIGHT_ROI),
+        (KP_LEFT_WRIST,  KP_LEFT_ELBOW,  "left",  "L", COLOR_LEFT_ROI, enforce_left_glove),
+        (KP_RIGHT_WRIST, KP_RIGHT_ELBOW, "right", "R", COLOR_RIGHT_ROI, enforce_right_glove),
     ]
-    for kp_idx, elbow_idx, side_key, side_label, roi_color in wrist_cfg:
+
+    for kp_idx, elbow_idx, side_key, side_label, roi_color, enforce_side in wrist_cfg:
+        if not enforce_side:
+            continue
         if keypoints is None or keypoints[kp_idx, 2] < 0.3:
             continue
+
         roi_size = dynamic_wrist_size(keypoints, kp_idx, elbow_idx)
         elbow_xy = keypoints[elbow_idx, :2] if keypoints[elbow_idx, 2] > 0.3 else None
         roi = wrist_roi_box(keypoints[kp_idx, :2], img_w, img_h,
                             elbow_xy=elbow_xy, size=roi_size)
         if roi is None:
             continue
+
         rx1, ry1, rx2, ry2 = roi
         best_overlap = max((box_overlap_ratio(roi, gb) for gb in glove_boxes), default=0.0)
         verdict, txt_color = judge(best_overlap)
         glove_status[side_key] = (verdict == "GLOVE")
+
         cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), roi_color, 2)
         font = cv2.FONT_HERSHEY_SIMPLEX
         cx, cy = (rx1+rx2)//2, ry1-8
         label  = f"{side_label}:{verdict}"
         detail = f"ovlp:{best_overlap:.2f}"
+
         (tw, th), _ = cv2.getTextSize(label, font, 0.65, 2)
         cv2.rectangle(frame, (cx-4, cy-th-4), (cx+tw+4, cy+4), (0, 0, 0), -1)
         cv2.putText(frame, label, (cx, cy), font, 0.65, txt_color, 2)
+
         (dw, dh), _ = cv2.getTextSize(detail, font, 0.45, 1)
         cv2.rectangle(frame, (cx-4, cy+4), (cx+dw+4, cy+dh+8), (0, 0, 0), -1)
         cv2.putText(frame, detail, (cx, cy+dh+6), font, 0.45, (200, 200, 200), 1)
@@ -670,6 +734,7 @@ def process_person(frame, px1, py1, px2, py2, img_w, img_h,
         "left_glove":  glove_status["left"],
         "right_glove": glove_status["right"],
     }
+
 
 
 def run_inference_on_frame(frame, cam_key: str):
@@ -699,9 +764,21 @@ def run_inference_on_frame(frame, cam_key: str):
         person_id = int(tid[i]) if tid is not None and tid[i] is not None else -1
 
         cv2.rectangle(frame, (bx1, by1), (bx2, by2), COLOR_PERSON, 2)
+
+        if area_id is None:
+            rule = {
+                "helmet": True,
+                "mask": True,
+                "left_glove": True,
+                "right_glove": True,
+            }
+        else:
+            rule = get_ppe_rule_for_area(area_id)
+
         status = process_person(frame, bx1, by1, bx2, by2, img_w, img_h,
-                                all_results, pose_results)
-        draw_ppe_status(frame, bx1, by1, person_id, conf, status)
+                                all_results, pose_results, ppe_rule=rule)
+        effective_status = apply_ppe_rule(status, rule)
+        draw_ppe_status(frame, bx1, by1, person_id, conf, effective_status, rule)
 
         if area_id is None:
             debug_throttle(
@@ -717,12 +794,12 @@ def run_inference_on_frame(frame, cam_key: str):
             )
             continue
 
-        events = violation_tracker.update(cam_key, person_id, status)
+        events = violation_tracker.update(cam_key, person_id, effective_status)
 
         if not events:
             debug_throttle(
                 f"event:{cam_key}:{person_id}",
-                f"[DB-WAIT] 이벤트 없음 | cam_key={cam_key} | area_id={area_id} | person_id={person_id} | status={status}"
+                f"[DB-WAIT] 이벤트 없음 | cam_key={cam_key} | area_id={area_id} | person_id={person_id} | status={status} | effective={effective_status} | rule={rule}"
             )
 
         for ev in events:
@@ -769,9 +846,13 @@ print("✓ 모델 로드 완료")
 
 print("▶ areas 매핑 로드 중...")
 CAMERA_AREA_MAP = load_camera_area_map()
+AREA_PPE_RULES = load_area_ppe_rules()
 print(f"✓ {len(CAMERA_AREA_MAP)}개 카메라 매핑 로드:")
 for ck, aid in CAMERA_AREA_MAP.items():
     print(f"  {ck} → area_id={aid}")
+print(f"✓ {len(AREA_PPE_RULES)}개 구역 PPE 단속 기준 로드:")
+for aid, rule in AREA_PPE_RULES.items():
+    print(f"  area_id={aid} → {rule}")
 
 violation_tracker = ViolationStateTracker()  # 기본값: 10초/300초
 violation_logger  = ViolationLogger()
@@ -800,6 +881,84 @@ def debug_throttle(key: str, msg: str, interval: float = 2.0):
     if now - last >= interval:
         print(msg, flush=True)
         _last_debug_print[key] = now
+
+
+AREA_CONFIG_REFRESH_INTERVAL = 10.0
+_last_area_config_refresh = 0.0
+
+
+def bool_rule_value(value, default: bool = True) -> bool:
+    """DB/JSON에서 온 bool, int, str 값을 안전하게 bool로 변환."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return int(value) != 0
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "t", "yes", "y", "on")
+    return bool(value)
+
+
+def rule_enabled(rule: dict, short_key: str, enforce_key: str, default: bool = True) -> bool:
+    """
+    area_loader 반환 형식이 {"mask": False} 이든
+    {"enforce_mask": False} 이든 모두 처리한다.
+    """
+    if not isinstance(rule, dict):
+        return default
+    if short_key in rule:
+        return bool_rule_value(rule.get(short_key), default)
+    if enforce_key in rule:
+        return bool_rule_value(rule.get(enforce_key), default)
+    return default
+
+
+def refresh_area_config_if_needed(force: bool = False):
+    """DB의 구역-카메라 매핑 및 PPE 단속 기준을 주기적으로 다시 로드."""
+    global CAMERA_AREA_MAP, AREA_PPE_RULES, _last_area_config_refresh
+
+    now = time.time()
+    if not force and now - _last_area_config_refresh < AREA_CONFIG_REFRESH_INTERVAL:
+        return
+
+    try:
+        CAMERA_AREA_MAP = load_camera_area_map()
+        AREA_PPE_RULES = load_area_ppe_rules()
+        _last_area_config_refresh = now
+    except Exception as e:
+        debug_throttle(
+            "area_config_reload",
+            f"[RULE-LOAD-FAIL] area/PPE 설정 재로드 실패: {type(e).__name__}: {e}",
+            interval=10.0
+        )
+
+
+def get_ppe_rule_for_area(area_id: int) -> dict:
+    """area_id의 PPE 단속 기준 반환. 누락 시 전체 단속."""
+    refresh_area_config_if_needed()
+    return AREA_PPE_RULES.get(area_id, {
+        "helmet": True,
+        "mask": True,
+        "left_glove": True,
+        "right_glove": True,
+    })
+
+
+def apply_ppe_rule(status: dict, rule: dict) -> dict:
+    """단속하지 않는 장비는 위반 추적에서 제외되도록 착용(True)으로 보정."""
+    filtered = dict(status)
+
+    if not rule_enabled(rule, "helmet", "enforce_helmet", True):
+        filtered["helmet"] = True
+    if not rule_enabled(rule, "mask", "enforce_mask", True):
+        filtered["mask"] = True
+    if not rule_enabled(rule, "left_glove", "enforce_glove_left", True):
+        filtered["left_glove"] = True
+    if not rule_enabled(rule, "right_glove", "enforce_glove_right", True):
+        filtered["right_glove"] = True
+
+    return filtered
 
 
 def update_annotated_frame(cam_name: str, frame):
