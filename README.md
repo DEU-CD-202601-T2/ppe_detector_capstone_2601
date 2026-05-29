@@ -8,7 +8,7 @@ YOLO-World 기반 PPE 객체 탐지, YOLO Pose 기반 관절 추정, ByteTrack �
 
 ## 주요 기능
 
-- **실시간 PPE 탐지**: YOLO-World TensorRT 엔진으로 `person`, `helmet`, `mask`, `glove`, `vest` 객체 탐지
+- **실시간 PPE 탐지**: YOLO-World TensorRT 엔진으로 `person`, `helmet`, `mask`, `glove` 객체 탐지
 - **Pose 기반 손 영역 판단**: YOLO Pose의 손목/팔꿈치 keypoint를 활용해 왼손·오른손 장갑 착용 여부 판별
 - **person 단위 추적**: `supervision.ByteTrack`으로 카메라별 작업자 ID 부여
 - **구역별 PPE 단속 기준 반영**: `areas.enforce_*` 컬럼에 따라 안전모, 마스크, 왼손 장갑, 오른손 장갑 단속 여부를 구역별로 제어
