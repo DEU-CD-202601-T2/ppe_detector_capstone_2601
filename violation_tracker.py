@@ -10,7 +10,7 @@ from typing import NamedTuple
 
 
 # ── 설정값 ────────────────────────────────────────────────
-SUSTAIN_SECONDS = 60.0     # 미착용 지속 시간 임계값
+SUSTAIN_SECONDS = 10.0     # 미착용 지속 시간 임계값
 COOLDOWN_SECONDS = 300.0   # 같은 (cam, pid, type) 재기록 방지 시간
 
 # PPE type 정의

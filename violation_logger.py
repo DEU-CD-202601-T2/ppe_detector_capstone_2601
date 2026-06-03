@@ -33,13 +33,19 @@ class ViolationLogger:
             area_id: int,
             person_id: int,
             image_jpeg: bytes,
+            enforced_ppe: str = "",
             detected_at: datetime | None = None):
-        """추론 스레드에서 호출. 즉시 리턴 (큐 적재만)."""
+        """추론 스레드에서 호출. 즉시 리턴 (큐 적재만).
+
+        enforced_ppe: 이 판정에서 단속 대상이던 장비 코드 콤마 문자열
+                      (예: "no_helmet,no_mask,no_glove_left,no_glove_right")
+        """
         item = {
             "violation_type": violation_type,
             "area_id":        area_id,
             "person_id":      person_id,
             "image_data":     image_jpeg,
+            "enforced_ppe":   enforced_ppe or "",
             "detected_at":    detected_at or datetime.now(),
         }
         try:
@@ -67,14 +73,15 @@ class ViolationLogger:
                 cur.execute(
                     "INSERT INTO violations "
                     "(violation_type, detected_at, area_id, person_id, "
-                    " image_data, image_mime, is_checked) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, 0)",
+                    " image_data, image_mime, enforced_ppe, is_checked) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, 0)",
                     (item["violation_type"],
                      item["detected_at"],
                      item["area_id"],
                      item["person_id"],
                      item["image_data"],
-                     "image/jpeg"),
+                     "image/jpeg",
+                     item["enforced_ppe"]),
                 )
             conn.commit()
             size_kb = len(item["image_data"]) / 1024

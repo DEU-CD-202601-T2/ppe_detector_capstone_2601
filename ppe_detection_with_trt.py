@@ -805,8 +805,20 @@ def run_inference_on_frame(frame, cam_key: str):
         for ev in events:
             try:
                 jpeg = crop_and_encode(original_frame, bx1, by1, bx2, by2)
+                # 이 판정에서 단속 대상이던 장비 코드 스냅샷 (방식 B)
+                enforced_codes = []
+                if rule_enabled(rule, "helmet", "enforce_helmet", True):
+                    enforced_codes.append("no_helmet")
+                if rule_enabled(rule, "mask", "enforce_mask", True):
+                    enforced_codes.append("no_mask")
+                if rule_enabled(rule, "left_glove", "enforce_glove_left", True):
+                    enforced_codes.append("no_glove_left")
+                if rule_enabled(rule, "right_glove", "enforce_glove_right", True):
+                    enforced_codes.append("no_glove_right")
+                enforced_ppe_snapshot = ",".join(enforced_codes)
+
                 print(
-                    f"[DB-TRY] violation_type={ev.violation_type}, area_id={area_id}, person_id={ev.person_id}",
+                    f"[DB-TRY] violation_type={ev.violation_type}, area_id={area_id}, person_id={ev.person_id}, enforced={enforced_ppe_snapshot}",
                     flush=True
                 )
                 violation_logger.log(
@@ -814,6 +826,7 @@ def run_inference_on_frame(frame, cam_key: str):
                     area_id=area_id,
                     person_id=ev.person_id,
                     image_jpeg=jpeg,
+                    enforced_ppe=enforced_ppe_snapshot,
                 )
                 print("[DB-OK] 위반 데이터 저장 완료", flush=True)
             except Exception as e:
